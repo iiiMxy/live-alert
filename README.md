@@ -5,7 +5,7 @@
 [![License](https://img.shields.io/github/license/iiiMxy/live-alert?color=blue)](https://github.com/iiiMxy/live-alert/blob/main/LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Bilibili%20%7C%20Douyin%20%7C%20Kick-informational)
 
-> 鉴于某摸鱼主播四处流窜，还存在偷偷开播不发消息——于是整了这么个小脚本
+> 鉴于某摸鱼主播四处流窜，还会偷偷开播，于是整了这么个小脚本
 
 一个 Tampermonkey 用户脚本：监控你关注的直播间，**开播时弹出带封面和标题的系统通知**，并记录开播历史。想盯谁自己加——支持 B站 / 抖音 / Kick，粘贴直播间链接就能识别，不看了随时删。不用装 Python、不用跑后台服务、不用开机自启，打开一个直播间页面就够了
 
