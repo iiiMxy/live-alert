@@ -1,5 +1,10 @@
 # 多平台开播提醒（B站 / 抖音 / Kick）
 
+[![Install](https://img.shields.io/badge/install-userscript-2ea44f)](https://raw.githubusercontent.com/iiiMxy/live-alert/main/live-alert.user.js)
+[![Release](https://img.shields.io/github/v/release/iiiMxy/live-alert?color=blue)](https://github.com/iiiMxy/live-alert/releases)
+[![License](https://img.shields.io/github/license/iiiMxy/live-alert?color=blue)](https://github.com/iiiMxy/live-alert/blob/main/LICENSE)
+![Platform](https://img.shields.io/badge/platform-Bilibili%20%7C%20Douyin%20%7C%20Kick-informational)
+
 > 鉴于某摸鱼主播四处流窜，还存在偷偷开播不发消息——于是整了这么个小脚本
 
 一个 Tampermonkey 用户脚本：监控你关注的直播间，**开播时弹出带封面和标题的系统通知**，并记录开播历史。不用装 Python、不用跑后台服务、不用开机自启，打开一个直播间页面就够了
@@ -59,11 +64,16 @@
 
 ## 安装
 
-### 方式一：从链接安装
+### 方式一：从链接安装（推荐）
 
 1. 装好 [Tampermonkey](https://www.tampermonkey.net/)（Edge / Chrome / Firefox 均可）
-2. 打开 `https://raw.githubusercontent.com/iiiMxy/live-alert/main/live-alert.user.js`
+2. 点这个链接安装 → **[安装 live-alert.user.js](https://raw.githubusercontent.com/iiiMxy/live-alert/main/live-alert.user.js)**
 3. Tampermonkey 会弹出安装页，点「安装」
+
+> **打不开 Raw 链接？**（国内网络常见）用镜像安装：
+> **[cdn.jsdelivr.net 镜像](https://cdn.jsdelivr.net/gh/iiiMxy/live-alert@main/live-alert.user.js)**
+>
+> 两个链接装出来的脚本完全一样，区别只在于以后从哪个地址检查更新。想固定版本可以把 `@main` 换成 `@1.0.0`。
 
 ### 方式二：手动新建
 
