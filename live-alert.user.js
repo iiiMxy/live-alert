@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         多平台开播提醒（B站 / 抖音 / Kick）
 // @namespace    https://github.com/iiiMxy/live-alert
-// @version      1.0.0
+// @version      1.0.1
 // @description  监控多个直播间的开播状态，开播时弹出带封面和标题的系统通知，并记录开播历史
 // @author       iMxy_
 // @license      MIT
@@ -32,7 +32,8 @@
  *   1. 直播间列表存在 GM 存储里，通过页面内的「设置」浮层增删，不写死在代码里；
  *   2. 每个平台一个 probe 函数，返回统一结构，新增平台只需再写一个函数；
  *   3. 只在「上次明确未开播 → 这次开播」时提醒，首次运行只建基线不打扰；
- *   4. 抖音页面近 1MB，解析出 roomId 后缓存，之后只调 2KB 的 reflow 接口。
+ *   4. 抖音页面近 1MB，解析出 roomId 后缓存，之后只调 2KB 的 reflow 接口；
+ *   5. 单实例锁：只有抢到锁的标签页在轮询，关页/刷新时主动交还，避免监控空窗。
  */
 
 (function () {
@@ -70,6 +71,12 @@
   ];
 
   /* ================= 2. 基础工具 ================= */
+  /* 报错里只说域名和路径，避免把整条带参数的 URL 塞进面板 */
+  function shortUrl(u) {
+    try { const a = new URL(u); return a.host + a.pathname; }
+    catch (e) { return String(u).slice(0, 60); }
+  }
+
   function gmFetch(url, extraHeaders) {
     return new Promise(function (resolve, reject) {
       let settled = false;
@@ -79,12 +86,25 @@
         url: url,
         headers: Object.assign({ Accept: 'application/json, text/html, */*' }, extraHeaders || {}),
         timeout: 15000,
-        onload: function (r) { done(resolve, r); },
-        onerror: function () { done(reject, new Error('网络错误')); },
-        ontimeout: function () { done(reject, new Error('超时')); },
+        onload: function (r) {
+          // 4xx/5xx 通常是风控页或 Cloudflare 挑战页，正文根本不是 JSON。
+          // 在这里就抛出来，比让后面的 JSON.parse 报 “Unexpected token <” 好排查得多。
+          if (r.status >= 400) return done(reject, new Error('HTTP ' + r.status + ' · ' + shortUrl(url)));
+          if (!r.status) return done(reject, new Error('无响应状态（被拦截或中断）· ' + shortUrl(url)));
+          done(resolve, r);
+        },
+        onerror: function () { done(reject, new Error('网络错误 · ' + shortUrl(url))); },
+        ontimeout: function () { done(reject, new Error('超时 · ' + shortUrl(url))); },
         onabort: function () { done(reject, new Error('已中断')); },
       });
     });
+  }
+
+  /* 接口偶尔会返回 HTML（风控/维护页），把这个事实说清楚，而不是丢一个语法错误 */
+  function parseJson(res, what) {
+    const txt = (res && res.responseText) || '';
+    try { return JSON.parse(txt); }
+    catch (e) { throw new Error((what || '接口') + '没返回 JSON（' + txt.length + ' 字节）'); }
   }
 
   function readJson(key, fallback) {
@@ -166,6 +186,7 @@
 
   function removeTarget(key) {
     saveTargets(loadTargets().filter(function (t) { return t.key !== key; }));
+    closeOpenLive(activeKeys());   // 删掉的那路若正在播，历史要收尾，否则永远停在「直播中」
   }
 
   function toggleTarget(key) {
@@ -174,19 +195,41 @@
       if (list[i].key === key) list[i].enabled = list[i].enabled === false;
     }
     saveTargets(list);
+    closeOpenLive(activeKeys());   // 停用的那路同理：不再轮询，也就没人替它收尾了
   }
 
   function activeTargets() {
     return loadTargets().filter(function (t) { return t.enabled !== false; });
   }
 
+  function activeKeys() {
+    return activeTargets().map(function (t) { return t.key; });
+  }
+
   /* ================= 4. 单实例锁 ================= */
+  /* 同一时刻只有一个标签页真正轮询，避免多个标签页重复弹通知。
+     过期阈值取 1.5 个轮询周期：比原来的 2.5 短，标签页崩掉后能更快有人接班；
+     正常关页 / 刷新不靠过期，由 releaseLeadership 主动交还。 */
+  function lockIsMine(cur) { return !!cur && cur.tab === TAB_ID; }
+
   function acquireLeadership() {
     const now = Date.now();
     const cur = readJson(LOCK_KEY, null);
-    if (cur && cur.tab !== TAB_ID && now - cur.ts < CONFIG.intervalMs * 2.5) return false;
+    if (cur && cur.tab !== TAB_ID && now - cur.ts < CONFIG.intervalMs * 1.5) return false;
     GM_setValue(LOCK_KEY, JSON.stringify({ tab: TAB_ID, ts: now }));
     return true;
+  }
+
+  /* 本轮结束时把时间戳往前推：轮次跑得久（对象多、网慢）也不会被别的标签页误判成“锁已死” */
+  function refreshLeadership() {
+    const cur = readJson(LOCK_KEY, null);
+    if (lockIsMine(cur)) GM_setValue(LOCK_KEY, JSON.stringify({ tab: TAB_ID, ts: Date.now() }));
+  }
+
+  /* 关页 / 刷新时主动交还：否则新标签页要干等到锁过期，这段空窗正好会漏掉开播 */
+  function releaseLeadership() {
+    const cur = readJson(LOCK_KEY, null);
+    if (lockIsMine(cur)) GM_setValue(LOCK_KEY, '');
   }
 
   /* ================= 5. 开播历史 ================= */
@@ -237,10 +280,28 @@
     return null;
   }
 
+  /* 停用 / 删除 / 清空之后，把「不再监控的那几路」还没闭合的记录收尾。
+     不这么做，历史面板会永远停在「直播中」，底部「上次开播」也一直被它占着。
+     keepKeys = 仍在监控的 key；传空数组就是全部收尾。
+     结束时间沿用最后观测到在播的那次 ts，和 tick 里的口径保持一致。 */
+  function closeOpenLive(keepKeys) {
+    const keep = keepKeys || [];
+    const h = loadHistory();
+    const prev = readJson(STATE_KEY, {});
+    let changed = false;
+    for (let i = 0; i < h.length; i++) {
+      if (h[i].endedAt || keep.indexOf(h[i].key) >= 0) continue;
+      const p = prev[h[i].key];
+      h[i].endedAt = (p && p.ts) || Date.now();
+      changed = true;
+    }
+    if (changed) saveHistory(h);
+  }
+
   /* ================= 6. 各平台探测 ================= */
   async function probeBilibili(t) {
     const res = await gmFetch('https://api.live.bilibili.com/room/v1/Room/get_info?room_id=' + encodeURIComponent(t.id));
-    const j = JSON.parse(res.responseText);
+    const j = parseJson(res, 'B站接口');
     if (!j || j.code !== 0) throw new Error('接口 code=' + (j && j.code));
     const d = j.data || {};
     let startedAt = null;
@@ -259,7 +320,7 @@
 
   async function probeKick(t) {
     const res = await gmFetch('https://kick.com/api/v2/channels/' + encodeURIComponent(t.id));
-    const j = JSON.parse(res.responseText);
+    const j = parseJson(res, 'Kick 接口');
     const ls = j && j.livestream;
     let startedAt = null;
     if (ls && ls.created_at) {
@@ -299,7 +360,7 @@
       'https://webcast.amemv.com/webcast/room/reflow/info/?room_id=' + roomId +
       '&type_id=0&live_id=1&app_id=1128&version_code=1'
     );
-    const j = JSON.parse(res.responseText);
+    const j = parseJson(res, '抖音 reflow');
     if (j && j.status_code && j.status_code !== 0) throw new Error('reflow code=' + j.status_code);
     const room = (j && j.data && (j.data.room || (j.data.data && j.data.data[0]))) || null;
     if (!room || typeof room.status !== 'number') return null;
@@ -588,12 +649,14 @@
   async function tick() {
     if (busy) return;
     busy = true;
+    let leader = false;
     try {
       if (!acquireLeadership()) {
         destroyHud();
         console.info('[LiveAlert] 另一个标签页正在监控，本页待命');
         return;
       }
+      leader = true;
 
       ensureHud();
       const targets = activeTargets();
@@ -643,6 +706,8 @@
       console.warn('[LiveAlert] 检查异常', e);
       if (hudFoot1) hudFoot1.textContent = '异常：' + ((e && e.message) || e);
     } finally {
+      // 轮次结束再盖一次时间戳：慢轮次（对象多/网络差）不会被判成锁已死
+      if (leader) refreshLeadership();
       busy = false;
     }
   }
@@ -682,7 +747,9 @@
   function fmtEntry(e) {
     const base = e.startedAt || e.detectedAt;
     const end = e.endedAt ? fmtWhen(e.endedAt) + '（' + fmtDur(e.endedAt - base) + '）' : '直播中';
-    return fmtWhen(base) + ' → ' + end + ' · ' + e.label + (e.title ? '「' + e.title + '」' : '');
+    // 标题来自平台，属于不可信内容；这里拼的是 innerHTML，必须转义
+    return fmtWhen(base) + ' → ' + end + ' · ' + esc(e.label) +
+      (e.title ? '「' + esc(e.title) + '」' : '');
   }
 
   async function runDouyinDiag() {
@@ -876,6 +943,7 @@
       else if (a === 'clearHist') { GM_setValue(HISTORY_KEY, '[]'); renderHistory(); status('历史已清空'); }
       else if (a === 'defaults') {
         saveTargets(JSON.parse(JSON.stringify(DEFAULT_TARGETS)));
+        closeOpenLive(activeKeys());   // 被挤掉的旧对象不再监控，历史收尾
         rebuildHud();
         renderMain();
         status('已恢复默认列表');
@@ -883,6 +951,7 @@
       else if (a === 'clearTargets') {
         if (!window.confirm('清空所有监控对象？之后可以点「恢复默认列表」找回。')) return;
         saveTargets([]);
+        closeOpenLive([]);             // 列表空了，所有未闭合的记录都收尾
         rebuildHud();
         renderMain();
         status('已清空监控对象');
@@ -916,6 +985,13 @@
     ensureHud();
     tick();
     setInterval(tick, CONFIG.intervalMs);
+
+    // 关页 / 刷新时把锁交还出去，下一个标签页 4 秒后就能接班；
+    // 只有真的卸载才交还，进 bfcache（persisted）不算，否则页面往返一趟就白让位了。
+    window.addEventListener('pagehide', function (e) {
+      if (!(e && e.persisted)) releaseLeadership();
+    });
+
     // 从后台切回来时补一次，避免节流造成的空档
     document.addEventListener('visibilitychange', function () {
       if (!document.hidden && Date.now() > nextAt - 5000) tick();
