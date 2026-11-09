@@ -1,13 +1,18 @@
 // ==UserScript==
 // @name         多平台开播提醒（B站 / 抖音 / Kick）
 // @namespace    https://github.com/iiiMxy/live-alert
-// @version      1.0.1
+// @version      1.0.2
 // @description  监控多个直播间的开播状态，开播时弹出带封面和标题的系统通知，并记录开播历史
 // @author       iMxy_
 // @license      MIT
 // @match        https://live.bilibili.com/*
 // @match        https://live.douyin.com/*
 // @match        https://kick.com/*
+// @match        https://www.bilibili.com/*
+// @match        https://space.bilibili.com/*
+// @match        https://search.bilibili.com/*
+// @match        https://t.bilibili.com/*
+// @match        https://www.douyin.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_notification
 // @grant        GM_setValue
@@ -33,7 +38,8 @@
  *   2. 每个平台一个 probe 函数，返回统一结构，新增平台只需再写一个函数；
  *   3. 只在「上次明确未开播 → 这次开播」时提醒，首次运行只建基线不打扰；
  *   4. 抖音页面近 1MB，解析出 roomId 后缓存，之后只调 2KB 的 reflow 接口；
- *   5. 单实例锁：只有抢到锁的标签页在轮询，关页/刷新时主动交还，避免监控空窗。
+ *   5. 单实例锁：只有抢到锁的标签页在轮询，关页/刷新时主动交还，避免监控空窗；
+ *   6. 匹配范围含 B站 / 抖音主站：平时浏览时也有页面在维持监控，真正轮询的仍只有抢到锁的那一个。
  */
 
 (function () {
@@ -56,6 +62,7 @@
   const POS_KEY = NS + '.hudpos.v1';
   const COLLAPSE_KEY = NS + '.hudcollapsed.v1';
   const HUD_ON_KEY = NS + '.hudon.v1';
+  const HUD_SCOPE_KEY = NS + '.hudscope.v1';
   const ROOMID_PREFIX = NS + '.roomid.';
   const TAB_ID = Math.random().toString(36).slice(2, 10);
 
@@ -356,9 +363,12 @@
   }
 
   async function douyinReflow(roomId, t) {
+    // 带上 Referer：脚本现在可能跑在 www.douyin.com 甚至 B站 的页面上，
+    // 这个非公开接口对来源比较挑，固定成直播站来源，行为和以前一致。
     const res = await gmFetch(
       'https://webcast.amemv.com/webcast/room/reflow/info/?room_id=' + roomId +
-      '&type_id=0&live_id=1&app_id=1128&version_code=1'
+      '&type_id=0&live_id=1&app_id=1128&version_code=1',
+      { Referer: 'https://live.douyin.com/' }
     );
     const j = parseJson(res, '抖音 reflow');
     if (j && j.status_code && j.status_code !== 0) throw new Error('reflow code=' + j.status_code);
@@ -383,6 +393,26 @@
     };
   }
 
+  function pageAttemptKey(k) { return NS + '.douyinpage.' + k; }
+
+  /* 抖音直播间页面 1MB 级，里面 roomId 到处都是：推荐位、广告、SSR 占位符。
+     实测第一个 "roomId" 往往是 "$undefined"，随手抓一个数字 ID 很容易抓串。
+     只能认准目标 web_rid 附近的那一个。 */
+  function findDouyinRoomId(flat, webRid) {
+    const rid = String(webRid);
+    const marks = ['"web_rid":"' + rid + '"', '"web_rid": "' + rid + '"'];
+    for (let m = 0; m < marks.length; m++) {
+      let at = flat.indexOf(marks[m]);
+      while (at >= 0) {
+        const win = flat.slice(Math.max(0, at - 4000), at + 4000);
+        const hit = win.match(/"roomId"\s*:\s*"?(\d{8,})/);
+        if (hit) return { roomId: hit[1], at: at };
+        at = flat.indexOf(marks[m], at + 1);
+      }
+    }
+    return null;
+  }
+
   async function probeDouyin(t, opts) {
     const debug = !!(opts && opts.debug);
     const cached = debug ? '' : GM_getValue(roomIdKey(t.key), '');
@@ -391,24 +421,37 @@
       try {
         const r = await douyinReflow(cached, t);
         if (r) return r;
+        GM_setValue(roomIdKey(t.key), '');        // 接口明确说没有这个房间，缓存作废
       } catch (e) {
-        if (/房间号不匹配/.test(String(e.message))) throw e;
+        const msg = String((e && e.message) || e);
+        if (/房间号不匹配/.test(msg)) {
+          GM_setValue(roomIdKey(t.key), '');      // 缓存真的指错了房间
+        } else {
+          // 网络 / 超时 / 风控：缓存本身没问题，不能为了一次抖动去重下 1MB 页面。
+          // 真要去页面兜底，最多 10 分钟一次，避免变成每分钟一次大下载。
+          const last = Number(GM_getValue(pageAttemptKey(t.key), '0')) || 0;
+          if (Date.now() - last < 10 * 60 * 1000) throw e;
+        }
       }
-      GM_setValue(roomIdKey(t.key), ''); // 缓存作废，往下重新解析
     }
 
+    GM_setValue(pageAttemptKey(t.key), String(Date.now()));
     const html = await douyinPage(t);
     const flat = unescapeHtmlJson(html);
-    const iRoom = flat.indexOf('"roomId"');
-    const roomId =
-      pick(/"roomId"\s*:\s*"?(\d{8,})/, flat) ||
-      pick(/"id_str"\s*:\s*"?(\d{8,})/, flat) ||
-      pick(/"room_id"\s*:\s*"?(\d{8,})/, flat);
+
+    const near = findDouyinRoomId(flat, t.id);
+    const iRoom = near ? near.at : flat.indexOf('"roomId"');
+    const roomId = near
+      ? near.roomId
+      : (pick(/"roomId"\s*:\s*"?(\d{8,})/, flat) || pick(/"room_id"\s*:\s*"?(\d{8,})/, flat));
 
     if (debug) {
       const diag = {
         len: html.length,
+        cache: cached ? '有' : '无',
+        how: near ? 'web_rid 附近' : (roomId ? '全页第一个数字 roomId' : '没找到'),
         roomId: roomId || null,
+        webRidAt: flat.indexOf('"web_rid":"' + t.id + '"'),
         roomIdSnip: iRoom < 0 ? null : flat.slice(Math.max(0, iRoom - 110), iRoom + 110).replace(/\s+/g, ' '),
       };
       console.info('[LiveAlert][douyin] 诊断 ' + JSON.stringify(diag));
@@ -425,7 +468,7 @@
       console.warn('[LiveAlert][douyin] reflow 失败：' + ((e && e.message) || e));
     }
 
-    // 兜底：解析页面 HTML 内联 JSON
+    // 兜底：解析页面内联 JSON。锚点用找到 web_rid 的位置，别拿 $undefined 那一段来猜。
     const scope = iRoom >= 0 ? flat.slice(Math.max(0, iRoom - 6000), iRoom + 6000) : flat;
     const st =
       pick(/"room_status"\s*:\s*"?(\d)/, scope) ||
@@ -513,8 +556,21 @@
     s.right = parts[1] === 'right' ? m.right + 'px' : 'auto';
   }
 
+  /* 面板显示范围：'all' = 所有匹配页面都显示；'live' = 只在直播间页面显示。
+     只影响“画不画面板”，不影响轮询——面板不画的页面照样能抢锁干活。 */
+  const LIVE_HOSTS = ['live.bilibili.com', 'live.douyin.com', 'kick.com'];
+  function hudScope() {
+    return GM_getValue(HUD_SCOPE_KEY, 'all') === 'live' ? 'live' : 'all';
+  }
+  function hudAllowedHere() {
+    return hudScope() === 'all' || LIVE_HOSTS.indexOf(location.hostname) >= 0;
+  }
+
   function ensureHud() {
     if (GM_getValue(HUD_ON_KEY, '1') !== '1') { destroyHud(); return null; }
+    if (!hudAllowedHere()) { destroyHud(); return null; }
+    // 站点重绘 / 路由切换可能把注入的节点冲掉，指针失效了就重建，别留个永远空的面板
+    if (hud && !hud.host.isConnected) destroyHud();
     if (hud) return hud;
 
     const targets = loadTargets();
@@ -607,7 +663,7 @@
   /* 监控对象变了之后重建面板（行数、点阵都要跟着变） */
   function rebuildHud() {
     destroyHud();
-    ensureHud();
+    try { ensureHud(); } catch (e) { console.warn('[LiveAlert] 面板重建失败', e); }
   }
 
   function renderRow(t, rec, history) {
@@ -645,6 +701,8 @@
   /* ================= 9. 主循环 ================= */
   let busy = false;
   let nextAt = 0;
+  let hudFails = 0;
+  let standbyLogged = false;
 
   async function tick() {
     if (busy) return;
@@ -653,12 +711,24 @@
     try {
       if (!acquireLeadership()) {
         destroyHud();
-        console.info('[LiveAlert] 另一个标签页正在监控，本页待命');
+        // 待命页面每轮都会走到这里，只在第一次打日志，别把控制台刷满
+        if (!standbyLogged) {
+          standbyLogged = true;
+          console.info('[LiveAlert] 另一个标签页正在监控，本页待命');
+        }
         return;
       }
       leader = true;
 
-      ensureHud();
+      // 面板只是显示层。主站页面可能因为 CSP / Trusted Types 拦住 shadow DOM 注入，
+      // 失败也只能少个面板，不能因此中断轮询——画不出面板还继续监控，比反过来强。
+      if (hudFails < 3) {
+        try { ensureHud(); } catch (e) {
+          hudFails++;
+          console.warn('[LiveAlert] 面板创建失败（第 ' + hudFails + ' 次）', e);
+        }
+      }
+
       const targets = activeTargets();
       const prev = readJson(STATE_KEY, {});
       const history = loadHistory();
@@ -801,8 +871,12 @@
     function renderMain() {
       const list = loadTargets();
       const cur = currentPos();
+      const sc = hudScope();
       const pos = function (p, label) {
         return '<button class="b' + (cur === p ? ' on' : '') + '" data-a="pos:' + p + '">' + label + '</button>';
+      };
+      const scopeBtn = function (v, label) {
+        return '<button class="b' + (sc === v ? ' on' : '') + '" data-a="scope:' + v + '">' + label + '</button>';
       };
 
       const items = list.length
@@ -827,6 +901,10 @@
         '<div class="sec">面板位置</div><div class="row">' +
         pos('top-left', '左上') + pos('top-right', '右上') +
         pos('bottom-left', '左下') + pos('bottom-right', '右下') + '</div>' +
+        '<div class="sec">面板显示范围</div><div class="row">' +
+        scopeBtn('all', '所有匹配页') + scopeBtn('live', '只在直播间') + '</div>' +
+        '<div style="font-size:11.5px;color:#8a8d95;margin-top:4px">' +
+        '只影响面板画在哪儿，不影响监控——两个选项下都会照常轮询。</div>' +
         '<div class="sec">开播历史</div><div class="row">' +
         '<button class="b" data-a="hist">查看最近 20 条</button>' +
         '<button class="b danger" data-a="clearHist">清空历史</button></div>' +
@@ -940,6 +1018,12 @@
         renderMain();
         status('面板位置已切换');
       }
+      else if (a.indexOf('scope:') === 0) {
+        GM_setValue(HUD_SCOPE_KEY, a.slice(6));
+        rebuildHud();
+        renderMain();
+        status(a.slice(6) === 'live' ? '面板只在直播间页面显示' : '面板在所有匹配页面显示');
+      }
       else if (a === 'clearHist') { GM_setValue(HISTORY_KEY, '[]'); renderHistory(); status('历史已清空'); }
       else if (a === 'defaults') {
         saveTargets(JSON.parse(JSON.stringify(DEFAULT_TARGETS)));
@@ -977,12 +1061,16 @@
   /* ================= 11. 菜单 ================= */
   if (typeof GM_registerMenuCommand === 'function') {
     GM_registerMenuCommand('显示/隐藏监控面板', toggleHud);
-    GM_registerMenuCommand('设置与工具…', openSettings);
+    // 主站页面可能有 CSP / Trusted Types 拦住 shadow DOM 注入，别让菜单点下去直接抛异常
+    GM_registerMenuCommand('设置与工具…', function () {
+      try { openSettings(); } catch (e) { console.warn('[LiveAlert] 设置面板打开失败', e); }
+    });
   }
 
   /* ================= 12. 启动 ================= */
   setTimeout(function () {
-    ensureHud();
+    // 不再无条件建面板：匹配范围扩到主站后，每个打开的 B站/抖音 页面都会跑这段，
+    // 待命页建了又拆只会闪一下。面板由 tick() 里抢到锁的那一个页面创建。
     tick();
     setInterval(tick, CONFIG.intervalMs);
 
@@ -992,9 +1080,10 @@
       if (!(e && e.persisted)) releaseLeadership();
     });
 
-    // 从后台切回来时补一次，避免节流造成的空档
+    // 从后台切回来时补一次，避免节流造成的空档。
+    // nextAt 只在抢到锁的页面才被赋值，待命页是 0——不加这个判断，切回标签页就会白跑一次 tick。
     document.addEventListener('visibilitychange', function () {
-      if (!document.hidden && Date.now() > nextAt - 5000) tick();
+      if (!document.hidden && nextAt > 0 && Date.now() > nextAt - 5000) tick();
     });
   }, 4000);
 })();
